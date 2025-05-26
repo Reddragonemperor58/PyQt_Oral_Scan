@@ -100,25 +100,6 @@ class DentalArchGridVisualizerQt:
         cam.SetFreezeFocalPoint(True)
         logging.info(f"GridVizQt (R{self.renderer_index}): Camera setup complete. Focal point frozen. Locked params stored.")
         
-        # --- Attempt to lock down 2D view (after fitting) ---
-        # # cam is already self.parent_plotter.camera for the active renderer
-        # if cam: # Ensure cam object is valid
-        #     # These methods are on the vtkCamera object
-        #     cam.SetFreezeFocalPoint(True) 
-        #     # cam.SetFreezePosition(True) # This would prevent panning and zooming by mouse drag
-        #     # cam.SetFreezeนู่นนี่นั่น(True) # This would prevent rotation if the style allowed it
-        #     logging.info(f"GridVizQt (R{self.renderer_index}): Camera focal point frozen.")
-        #      # 2. Explicitly set and potentially try to maintain the ViewUp vector.
-        # #    For a typical 2D XY plot, Y is up, X is right, Z is out of screen.
-        # #    If your grid is on XY plane, view up is likely (0,1,0).
-        # #    _fit_camera_to_grid should ideally set this. We can reinforce it.
-        #     current_view_up = cam.GetViewUp()
-        #     desired_view_up = (0, 1, 0) # Assuming grid is on XY, looking along Z
-        #     if not np.allclose(current_view_up, desired_view_up):
-        #         # cam.SetViewUp(desired_view_up) # _fit_camera_to_grid should handle this
-        #         pass # _fit_camera_to_grid sets the initial orientation
-        #     # --- End Lock Down ---
-
         if self.tooth_cell_definitions and hasattr(self.processor, 'calculate_cof_trajectory'):
             self.processor.calculate_cof_trajectory(self.tooth_cell_definitions)
         
