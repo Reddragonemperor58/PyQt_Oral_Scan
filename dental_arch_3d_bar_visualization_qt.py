@@ -1,220 +1,249 @@
 # --- START OF FILE dental_arch_3d_bar_visualization_qt.py ---
 import numpy as np
-from vedo import Plotter, Text2D, Cylinder, Box, Line, Axes, Grid, Plane, Text3D
+from vedo import Text2D, Cylinder, Box, Line, Axes, Grid, Plane, Text3D, colors 
 import logging
+import vtk 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DentalArch3DBarVisualizerQt:
-    def __init__(self, processor, plotter_instance): # Receives a Vedo Plotter
+    def __init__(self, processor, parent_plotter_instance, renderer_index):
         self.processor = processor
-        self.plotter = plotter_instance # Use the passed plotter
+        self.parent_plotter = parent_plotter_instance 
+        self.renderer_index = renderer_index         
+        self.renderer = parent_plotter_instance.renderers[renderer_index] 
 
         if self.processor.cleaned_data is None: self.processor.create_force_matrix()
         self.num_data_teeth = len(self.processor.tooth_ids) if self.processor.tooth_ids else 0
-        if self.num_data_teeth == 0: logging.error("3DBarVizQt: No tooth data."); self._initialize_empty_state(); return
-
+        
         self.arch_layout_width = 14.0; self.arch_layout_depth = 8.0; self.bar_base_radius = 0.5     
-        self.tooth_bar_base_positions = self._create_bar_base_positions(self.num_data_teeth, self.arch_layout_width, self.arch_layout_depth)
+        self.tooth_bar_base_positions = [] 
         self.max_force_for_scaling = self.processor.max_force_overall if hasattr(self.processor,'max_force_overall') else 100.0
         self.max_bar_height = 5.0; self.min_bar_height = 0.1 
-
-        # --- Store Initial Camera Parameters ---
-        self.initial_camera_settings = {}
-        # ---
-
-        # Camera and static elements setup (on self.plotter)
-        if self.plotter:
-            istyle = self.plotter.interactor.GetInteractorStyle()
-            if hasattr(istyle, 'SetMotionFactor'): # Common in trackball styles
-                # iStyle.SetMotionFactor(0.0) # Disables motion, might be too restrictive
-                pass 
-            self.plotter.interactor_style = 1 # JoystickActor: a bit different, might work
-            floor_size_x=self.arch_layout_width*1.5; floor_size_y=self.arch_layout_depth*1.8
-            floor_grid_res=(10,10); floor_grid=Grid(s=(floor_size_x,floor_size_y),res=floor_grid_res,c='gainsboro',alpha=0.4)
-            self.grid_center_y=-self.arch_layout_depth*0.3; floor_grid.pos(0,self.grid_center_y,-0.05)
-            self.plotter.add(floor_grid)
-             # Initialize and store camera settings
-            self.reset_camera_view() # Call to set and store initial view
-
-            if self.plotter.actors: self.axes_actor=Axes(self.plotter.actors,c='dimgrey',yzgrid=False); self.plotter.add(self.axes_actor)
-            else: self.plotter.add_global_axes(axtype=1,c='dimgrey')
-            self.plotter.camera.SetPosition(0,-self.arch_layout_depth*2.5,self.max_bar_height*2.2) 
-            self.plotter.camera.SetFocalPoint(0,self.grid_center_y,self.max_bar_height/3); self.plotter.camera.SetViewUp(0,0.3,0.7) 
+        self.grid_center_y = -self.arch_layout_depth * 0.3 
+        self.initial_camera_settings = {} 
 
         self.timestamps = self.processor.timestamps; self.current_timestamp_idx = 0; self.last_animated_timestamp = None 
-        self.force_bar_actors = []; self.time_text_actor = None; self.arch_base_line_actor = None; self.tooth_label_actors = []
+        self.force_bar_actors = []; self.time_text_actor = None; self.arch_base_line_actor = None; self.tooth_label_actors = []    
+        self.floor_grid_actor = None; self.axes_actor_local = None    
+        self.selected_tooth_id_3dbar = None 
+        self.main_app_window_ref = None
+
+        if self.num_data_teeth == 0:
+            logging.error(f"3DBarVizQt (Renderer {self.renderer_index}): No tooth data."); return
+
+    def set_animation_controller_for_interaction(self, controller):
+        self.main_app_window_ref = controller
+
+    def setup_scene(self):
+        if not self.renderer or not self.parent_plotter: logging.error(f"3DBarVizQt (R{self.renderer_index}): Renderer/ParentPlotter missing."); return
+        if self.num_data_teeth == 0:
+            if self.renderer: self.renderer.AddActor(Text2D("No 3D Bar Data", c='red', s=1.5).actor); return
+
+        self.parent_plotter.at(self.renderer_index) 
+        floor_size_x=self.arch_layout_width*1.5; floor_size_y=self.arch_layout_depth*1.8
+        floor_grid_res=(10,10); self.floor_grid_actor=Grid(s=(floor_size_x,floor_size_y),res=floor_grid_res,c='gainsboro',alpha=0.4)
+        self.floor_grid_actor.pos(0,self.grid_center_y,-0.05); 
+        # --- CORRECTED ADD ---
+        self.renderer.AddActor(self.floor_grid_actor.actor) 
+        # --- END CORRECTION ---
+        self.reset_camera_view() # This method will now use self.parent_plotter.camera
+
+        cam = self.parent_plotter.camera # Get camera for the active renderer
+        cam.SetPosition(0,-self.arch_layout_depth*2.0,self.max_bar_height*1.5) 
+        cam.SetFocalPoint(0,self.grid_center_y*0.5,self.max_bar_height/4)
+        cam.SetViewUp(0,0.4,0.6); 
+        self.renderer.ResetCamera() 
+        self.renderer.ResetCameraClippingRange()
+
+        self.initial_camera_settings = {'position':cam.GetPosition(),'focal_point':cam.GetFocalPoint(),'viewup':cam.GetViewUp()}
+
+        self.tooth_bar_base_positions = self._create_bar_base_positions(self.num_data_teeth, self.arch_layout_width, self.arch_layout_depth)
+        self._initialize_static_elements() 
         
-        if self.num_data_teeth > 0: self._initialize_static_elements()
+        # if self.parent_plotter and hasattr(self, '_on_mouse_click'):
+        #     self.parent_plotter.add_callback('mouse click', self._on_mouse_click)
 
-    def _initialize_empty_state(self): # Not strictly needed if __init__ handles no data
-        self.tooth_bar_base_positions=[]; self.timestamps=[]
-        self.current_timestamp_idx=0; self.last_animated_timestamp=None; self.force_bar_actors=[]
-        self.time_text_actor=None; self.arch_base_line_actor=None; self.tooth_label_actors=[]
-
-    def _create_bar_base_positions(self, num_teeth, total_width, total_depth): # Same
-        if num_teeth == 0: return []
-        x_coords = np.array([0.0]) if num_teeth==1 else np.linspace(-total_width/2,total_width/2,num_teeth)
-        k = total_depth/((total_width/2)**2) if total_width!=0 else 0
+    def _create_bar_base_positions(self, num_teeth, total_width, total_depth):
+        if num_teeth == 0: return [] # x_coords not defined here
+        positions_3d = []
+        if num_teeth == 1: 
+            x_coords = np.array([0.0]) # x_coords defined here
+        else: 
+            x_coords = np.linspace(-total_width / 2, total_width / 2, num_teeth) # x_coords defined here
+        
+        # This line uses x_coords. If num_teeth was 0, x_coords was never defined.
+        k = total_depth / ((total_width / 2)**2) if total_width != 0 else 0
+        # The list comprehension is outside the if/else for num_teeth == 1
         return [np.array([x,total_depth-k*(x**2)-total_depth*0.8,0.0]) for x in x_coords]
+    
 
-    def _initialize_static_elements(self): # Draws on self.plotter
-        if not self.plotter: return
-        static_actors_to_add = []
+    def _initialize_static_elements(self): 
+        if not self.renderer or not self.tooth_bar_base_positions: return
+        static_actors_to_add_vedo = [] # Collect Vedo objects
         if len(self.tooth_bar_base_positions)>1:
             line_pts=[(p[0],p[1],0.01) for p in self.tooth_bar_base_positions]
-            self.arch_base_line_actor=Line(line_pts,c='dimgray',lw=3,alpha=0.8); static_actors_to_add.append(self.arch_base_line_actor)
+            self.arch_base_line_actor=Line(line_pts,c='dimgray',lw=2,alpha=0.7); static_actors_to_add_vedo.append(self.arch_base_line_actor)
             self.tooth_label_actors=[]
             for i,pos in enumerate(self.tooth_bar_base_positions):
                 if i < len(self.processor.tooth_ids):
                     tid=self.processor.tooth_ids[i]
-                    lbl_pos=(pos[0],pos[1]+self.bar_base_radius*0.5,-0.2) 
-                    lbl=Text3D(str(tid),pos=lbl_pos,s=0.22,c=(0.1,0.1,0.1),depth=0.01,justify='ct')
-                    self.tooth_label_actors.append(lbl)
-            if self.tooth_label_actors: static_actors_to_add.extend(self.tooth_label_actors)
-        if static_actors_to_add: self.plotter.add(static_actors_to_add)
+                    lbl_pos=(pos[0],pos[1]-self.bar_base_radius*0.7,-0.1) 
+                    lbl=Text3D(str(tid),pos=lbl_pos,s=0.20,c=(0.2,0.2,0.2),depth=0.01,justify='ct')
+                    self.tooth_label_actors.append(lbl); static_actors_to_add_vedo.append(lbl)
+        if static_actors_to_add_vedo: 
+            for vo in static_actors_to_add_vedo: self.renderer.AddActor(vo.actor) # Add .actor
 
-    def render_display(self, timestamp): # Updates actors on self.plotter
-        if not self.tooth_bar_base_positions or not self.plotter: return
-        actors_to_remove = []
-        if self.time_text_actor: actors_to_remove.append(self.time_text_actor)
-        if self.force_bar_actors: actors_to_remove.extend(self.force_bar_actors)
-        if actors_to_remove: self.plotter.remove(actors_to_remove)
+    def render_display(self, timestamp): 
+        if not self.tooth_bar_base_positions or not self.renderer: return
+        self.parent_plotter.at(self.renderer_index) 
+        
+        actors_to_remove_vtk = []
+        if self.time_text_actor: actors_to_remove_vtk.append(self.time_text_actor.actor)
+        for act in self.force_bar_actors: actors_to_remove_vtk.append(act.actor)
+        for vtk_act in actors_to_remove_vtk: 
+            if vtk_act: self.renderer.RemoveActor(vtk_act)
+        
         self.force_bar_actors.clear(); self.time_text_actor = None
         
-        current_actors_to_add = []
-        self.time_text_actor = Text2D(f"Time: {timestamp:.1f}s", pos="bottom-right", c='k', bg=(1,1,1), alpha=0.6, s=0.8)        
-        current_actors_to_add.append(self.time_text_actor)
+        current_vedo_actors_to_add = []
+        self.time_text_actor = Text2D(f"Time: {timestamp:.1f}s",pos="bottom-right",c='k',bg=(1,1,1),alpha=0.6,s=0.7)
+        current_vedo_actors_to_add.append(self.time_text_actor)
 
         for i,base_pos in enumerate(self.tooth_bar_base_positions):
             if i >= len(self.processor.tooth_ids): continue
-            tid=self.processor.tooth_ids[i]; _,f_series=self.processor.get_average_force_for_tooth(tid)
+            tooth_id=self.processor.tooth_ids[i]; _,f_series=self.processor.get_average_force_for_tooth(tooth_id)
             curr_f=0.0
             if self.timestamps and len(f_series)==len(self.timestamps):
                 try: idx=np.argmin(np.abs(np.array(self.timestamps)-timestamp)); curr_f=f_series[idx]
-                except Exception: pass 
+                except: pass 
             if not np.isfinite(curr_f): curr_f=0.0
             norm_f=min(1.0,max(0.0,curr_f/self.max_force_for_scaling))
             bar_h=self.min_bar_height+norm_f*(self.max_bar_height-self.min_bar_height)
             if curr_f<1e-3: bar_h=0.0 
             if bar_h>1e-4: 
-                if norm_f<0.01:clr=(0.1,0.1,0.6)    
-                elif norm_f<0.25:clr=(0.2,0.4,1)  
+                if norm_f<0.01:clr=(0.1,0.1,0.6) 
+                elif norm_f<0.25:clr=(0.2,0.4,1) 
                 elif norm_f<0.5:clr=(0.1,0.8,0.4) 
-                elif norm_f<0.75:clr=(1,0.9,0.1)    
-                elif norm_f<0.9:clr=(1,0.4,0)  
+                elif norm_f<0.75:clr=(1,0.9,0.1)   
+                elif norm_f<0.9:clr=(1,0.4,0) 
                 else: clr=(0.9,0.0,0.2)                    
                 bar_cz=base_pos[2]+bar_h/2.0
-                bar=Box(pos=(base_pos[0],base_pos[1],bar_cz),length=self.bar_base_radius*1.7,width=self.bar_base_radius*1.7,height=bar_h,c=clr,alpha=0.92)
-                bar.name=f"Bar_Tooth_{tid}"; bar.pickable=True
-                self.force_bar_actors.append(bar); current_actors_to_add.append(bar)
-        if current_actors_to_add: self.plotter.add(current_actors_to_add)
-        # if self.plotter and self.plotter.window: # Or just self.plotter if offscreen is possible for screenshots
-        #     self.plotter.render()
-        # self.plotter.render() # QtPlotter handles rendering
+                bar=Box(pos=(base_pos[0],base_pos[1],bar_cz),length=self.bar_base_radius*1.6,width=self.bar_base_radius*1.6,height=bar_h,c=clr,alpha=0.92)
+                bar.name=f"Bar_Tooth_{tooth_id}"; bar.pickable=True
+                if self.selected_tooth_id_3dbar == tooth_id: bar.color('yellow').alpha(1.0)
+                self.force_bar_actors.append(bar); current_vedo_actors_to_add.append(bar)
+        
+        if current_vedo_actors_to_add: 
+            for vo in current_vedo_actors_to_add: self.renderer.AddActor(vo.actor)
 
-    def animate(self, event=None): # Called by QTimer via MainAppWindow
+    def animate(self, timestamp_to_render): 
         if not self.timestamps: return
-        if self.current_timestamp_idx >= len(self.timestamps): self.current_timestamp_idx = 0
-        
-        t = self.timestamps[self.current_timestamp_idx]
-        self.last_animated_timestamp = t
-        self.render_display(t) 
-        
-        self.current_timestamp_idx = (self.current_timestamp_idx + 1) % len(self.timestamps)
-
-    def get_frame_as_array(self, timestamp_to_render):
-        if not self.plotter: 
-            logging.warning(f"GRIDVIZ: Plotter not available for screenshot at T={timestamp_to_render}")
-            return None
-
-        # 1. Ensure the visualizer's actors are updated for this specific timestamp.
-        #    Temporarily set the state for this render, then restore.
-        original_anim_idx = self.current_timestamp_idx
-        original_last_ts = self.last_animated_timestamp
-
-        render_idx = original_anim_idx 
-        if self.timestamps and len(self.timestamps) > 0:
-            try:
-                render_idx = np.argmin(np.abs(np.array(self.timestamps) - timestamp_to_render))
-            except Exception as e:
-                logging.debug(f"GRIDVIZ: Error finding index for timestamp {timestamp_to_render}: {e}")
-        
-        self.current_timestamp_idx = render_idx
         self.last_animated_timestamp = timestamp_to_render
-        
-        # This call updates the actors on self.plotter but SHOULD NOT call self.plotter.render()
-        # The render call will be done explicitly below.
-        self.render_display(timestamp_to_render) 
-        
-        # 2. Explicitly make this plotter's render window current and render IT.
-        img_array = None
-        if self.plotter.renderer and self.plotter.window: 
-            # Get the specific VTK RenderWindow for this plotter
-            render_window = self.plotter.renderer.GetRenderWindow()
-            
-            # --- Critical Section for Screenshotting a Specific Plotter ---
-            # This sequence attempts to ensure this plotter's context is active
-            # for the screenshot operation.
-            # If self.plotter.offscreen was True, these might not be needed or behave differently.
-            # We assume self.plotter.offscreen is False for the live view.
-            
-            # render_window.MakeCurrent() # We found this caused issues with closing other windows. AVOID.
+        self.render_display(timestamp_to_render)
 
-            # Instead, ensure its content is flushed to its buffer by rendering it.
-            logging.debug(f"GRIDVIZ: Explicitly rendering plotter '{self.plotter.title}' for screenshot.")
-            self.plotter.render() # Render this specific plotter's scene.
-
-            # Now take the screenshot from this plotter
-            img_array = self.plotter.screenshot(asarray=True)
-            # --- End Critical Section ---
-        else:
-            logging.warning(f"GRIDVIZ: Plotter for '{self.plotter.title}' has no window or renderer for screenshot. Screenshot might be blank.")
-
-        # 3. Restore original animation state for the live interactive view
-        self.current_timestamp_idx = original_anim_idx
-        self.last_animated_timestamp = original_last_ts
-        
-        if img_array is None:
-            logging.warning(f"GRIDVIZ: Screenshot returned None for T={timestamp_to_render:.1f}s from plotter '{self.plotter.title}'")
-        return img_array
+    def get_frame_as_array(self, timestamp_to_render): # Not used if MainApp screenshots main plotter
+        logging.warning("get_frame_as_array called on individual 3DBar viz; main plotter should screenshot.")
+        return None 
 
     def reset_camera_view(self):
-        """Sets the camera to a predefined initial view and stores these settings."""
-        if not self.plotter: return
-
+        if not self.renderer or not self.parent_plotter: return
+        
+        self.parent_plotter.at(self.renderer_index) # ***** IMPORTANT *****
+        
+        cam = self.parent_plotter.camera # Now refers to the correct camera
         # Define your desired initial camera parameters here
-        pos = (0, -self.arch_layout_depth * 2.5, self.max_bar_height * 2.2)
-        focal_point = (0, self.grid_center_y if hasattr(self, 'grid_center_y') else 0, self.max_bar_height / 3)
-        view_up = (0, 0.3, 0.7) # Or (0,1,0) or (0,0,1) depending on desired orientation
+        pos = self.initial_camera_settings.get('position', (0, -self.arch_layout_depth * 2.0, self.max_bar_height * 1.5))
+        focal_point = self.initial_camera_settings.get('focal_point', (0, self.grid_center_y * 0.5, self.max_bar_height / 4))
+        view_up = self.initial_camera_settings.get('viewup', (0, 0.4, 0.6))
 
-        self.plotter.camera.SetPosition(pos)
-        self.plotter.camera.SetFocalPoint(focal_point)
-        self.plotter.camera.SetViewUp(view_up)
-        self.plotter.reset_camera() # Important: applies settings and fits content
+        cam.SetPosition(pos)
+        cam.SetFocalPoint(focal_point)
+        cam.SetViewUp(view_up)
+        
+        # ResetCamera on the specific renderer is crucial for subplots
+        self.renderer.ResetCamera() 
+        self.renderer.ResetCameraClippingRange()
 
-        # Store these settings
-        self.initial_camera_settings = {
-            'position': pos,
-            'focal_point': focal_point,
-            'viewup': view_up,
-            # 'distance': self.plotter.camera.GetDistance(), # Optional
-            # 'clipping_range': self.plotter.camera.GetClippingRange(), # Optional
-        }
-        logging.info(f"3DBarView: Camera reset to initial settings: {self.initial_camera_settings}")
-        if self.plotter.window and self.plotter.renderer: # Ensure render if window exists
-            self.plotter.render()
+        if not self.initial_camera_settings: # Store initial settings
+            self.initial_camera_settings = {'position':cam.GetPosition(), 'focal_point':cam.GetFocalPoint(), 'viewup':cam.GetViewUp()}
+            
+        logging.info(f"3DBarViz (R{self.renderer_index}): Camera (re)set.")
 
-    def apply_camera_settings(self, settings):
-        """Applies a given set of camera settings."""
-        if not self.plotter or not settings: return
-        self.plotter.camera.SetPosition(settings.get('position', self.plotter.camera.GetPosition()))
-        self.plotter.camera.SetFocalPoint(settings.get('focal_point', self.plotter.camera.GetFocalPoint()))
-        self.plotter.camera.SetViewUp(settings.get('viewup', self.plotter.camera.GetViewUp()))
-        # if 'distance' in settings: self.plotter.camera.SetDistance(settings['distance'])
-        # if 'clipping_range' in settings: self.plotter.camera.SetClippingRange(settings['clipping_range'])
-        self.plotter.reset_camera() # Re-apply and fit
-        if self.plotter.window and self.plotter.renderer:
-            self.plotter.render()
 
-# --- END OF FILE dental_arch_3d_bar_visualization_qt.py ---
+    def _on_mouse_click(self, event): # event is vedo.interaction.Event
+        # The dispatcher (_dispatch_mouse_click in EmbeddedVedoMultiViewWidget) should have
+        # already determined that this event is relevant to this renderer's actors or its background.
+        # A final sanity check using event.renderer can be added if necessary, but ideally dispatcher handles it.
+        # if not self.renderer or getattr(event, 'renderer', None) != self.renderer:
+        #     return
+
+        clicked_tooth_id_parsed = None
+        
+        if event.actor: # An actor within this renderer was clicked
+            actor_name = event.actor.name
+            logging.info(f"3DBarVizQt (R{self.renderer_index if hasattr(self, 'renderer_index') else 'N/A'}) Processing Click: Actor '{actor_name}' at {event.picked3d}")
+            if actor_name and actor_name.startswith("Bar_Tooth_"): # Check for Bar_Tooth_ prefix
+                try: 
+                    clicked_tooth_id_parsed = int(actor_name.split("_")[-1])
+                except ValueError: 
+                    logging.warning(f"3DBarVizQt: Could not parse tooth_id from actor name: {actor_name}")
+        else: # Background of this specific renderer was clicked (event.actor is None)
+            logging.info(f"3DBarVizQt (R{self.renderer_index if hasattr(self, 'renderer_index') else 'N/A'}): Processing background click for its renderer.")
+
+        # Update selection state for highlighting within this visualizer
+        if clicked_tooth_id_parsed is not None: # Clicked on a recognizable bar
+            if self.selected_tooth_id_3dbar == clicked_tooth_id_parsed: # Clicking the same selected bar
+                self.selected_tooth_id_3dbar = None # Deselect it
+                logging.info(f"--- 3DBarVizQt: Tooth {clicked_tooth_id_parsed} deselected for highlight. ---")
+            else: # Clicking a new bar or a previously unselected bar
+                self.selected_tooth_id_3dbar = clicked_tooth_id_parsed
+                logging.info(f"--- 3DBarVizQt: Tooth {clicked_tooth_id_parsed} selected for highlight. ---")
+        elif event.actor is None : # True background click for this renderer (or global deselect propagated)
+             if self.selected_tooth_id_3dbar is not None: 
+                 logging.info(f"--- 3DBarVizQt: Deselecting tooth {self.selected_tooth_id_3dbar} (background click). ---")
+             self.selected_tooth_id_3dbar = None
+        elif event.actor is not None and clicked_tooth_id_parsed is None: # Clicked unrecognized actor in this renderer
+            if self.selected_tooth_id_3dbar is not None:
+                logging.info(f"--- 3DBarVizQt: Deselecting tooth {self.selected_tooth_id_3dbar} (unrecognized actor click). ---")
+            self.selected_tooth_id_3dbar = None
+            
+        # Signal MainAppWindow (via main_app_window_ref) to update other UI parts
+        if self.main_app_window_ref: 
+            # 1. Update the graph
+            self.main_app_window_ref.update_graph_on_click(self.selected_tooth_id_3dbar) # Pass current selection
+            
+            # 2. Update the detailed info panel in MainAppWindow
+            detail_info_text = "Click a tooth/bar for details." # Default message
+            if self.selected_tooth_id_3dbar is not None:
+                timestamp_for_info = self.last_animated_timestamp 
+                if timestamp_for_info is None and self.timestamps and len(self.timestamps) > 0 : 
+                    # If animation hasn't started, use the current index (likely 0)
+                    ts_idx = self.current_timestamp_idx if self.current_timestamp_idx < len(self.timestamps) else 0
+                    timestamp_for_info = self.timestamps[ts_idx]
+                elif timestamp_for_info is None: # Absolute fallback
+                    timestamp_for_info = 0.0
+                
+                # For 3D bar, we typically show average force for the selected tooth
+                _ , avg_force_series = self.processor.get_average_force_for_tooth(self.selected_tooth_id_3dbar)
+                current_avg_force = 0.0
+                if self.timestamps and len(avg_force_series) == len(self.timestamps):
+                    try:
+                        # Find the index for the current timestamp
+                        time_idx_info = np.argmin(np.abs(np.array(self.timestamps) - timestamp_for_info))
+                        current_avg_force = avg_force_series[time_idx_info]
+                    except Exception as e:
+                        logging.debug(f"3DBarVizQt: Error getting avg force for info panel: {e}")
+                
+                detail_info_text = (f"3D Bar - Tooth ID: {self.selected_tooth_id_3dbar}\n"
+                                    f"Avg Force @ {timestamp_for_info:.1f}s: {current_avg_force:.1f} N")
+            self.main_app_window_ref.update_detailed_info(detail_info_text)
+        
+        # Conditional re-render if animation is paused to show highlight changes
+        if self.main_app_window_ref and hasattr(self.main_app_window_ref, 'is_animating') and \
+           not self.main_app_window_ref.is_animating:
+            if hasattr(self.main_app_window_ref, 'force_render_vedo_views'):
+                logging.info(f"3DBarVizQt (R{self.renderer_index if hasattr(self, 'renderer_index') else 'N/A'}): Click - main animation paused, requesting main Vedo render.")
+                current_t_render = self.last_animated_timestamp if self.last_animated_timestamp is not None else (self.timestamps[0] if self.timestamps else 0.0)
+                if current_t_render is not None: 
+                    self.main_app_window_ref.force_render_vedo_views(current_t_render)
